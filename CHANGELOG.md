@@ -1,0 +1,8 @@
+# Changelog
+
+All notable changes to Mac Security Audit are documented here.
+
+## [1.0.0] - 2026-04-08
+
+### Added
+- Initial release
