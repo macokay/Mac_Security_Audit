@@ -1,29 +1,41 @@
 ---
 name: Bug report
-about: Report a problem with Mac Security Audit
-title: '[Bug] '
+about: Report a bug with this tool
+title: "[BUG] "
 labels: bug
-assignees: ''
+assignees: macokay
 ---
 
-**Describe the bug**
-A clear and concise description of what the bug is.
+## Describe the bug
 
-**To reproduce**
-1. Go to '...'
-2. Click on '...'
+A clear and concise description of what is wrong.
+
+## Steps to reproduce
+
+1. Run `bash audit.sh`
+2. '...'
 3. See error
 
-**Expected behaviour**
-What you expected to happen.
+## Expected behaviour
 
-**Screenshots / logs**
-If applicable, add screenshots or paste relevant log output.
+A clear description of what you expected to happen.
 
-**Environment**
-- Mac Security Audit version: [e.g. v1.0.0]
-- macOS version: [e.g. Sequoia 15.4]
-- Chip: [e.g. Apple M2 / Intel i7]
+## Actual behaviour
 
-**Additional context**
-Any other context about the problem.
+What actually happened.
+
+## Console errors
+
+Paste any relevant terminal output below.
+
+```
+[paste output here]
+```
+
+## Environment
+
+| Field | Value |
+|---|---|
+| Tool version | |
+| macOS version | |
+| Chip | Apple Silicon / Intel |
