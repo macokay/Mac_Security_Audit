@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# Mac Security Audit Tool v1.0.0
+# Mac Security Audit Tool v1.0.1
 # Copyright (C) 2026 Mac O Kay. Free to use and modify for personal, non-commercial use.
 #
 # macOS endpoint security audit tool generating HTML compliance reports.
@@ -16,6 +16,7 @@
 #   --quiet             Suppress console output
 #   --privacy           Redact hostnames, usernames, IPs, serials
 #   --export-json       Also export JSON report
+#   --export-csv        Also export CSV report
 #   --report-name <n>   Custom prefix for report filename
 #   --help              Show this help
 # ============================================================================
@@ -26,19 +27,23 @@ set -euo pipefail
 # CONFIGURATION & GLOBALS
 # ============================================================================
 
-AUDIT_VERSION="1.0.0"
+AUDIT_VERSION="1.0.1"
 AUDIT_DATE=$(date '+%Y-%m-%d %H:%M:%S')
 HOSTNAME_RAW=$(scutil --get ComputerName 2>/dev/null || hostname -s)
+CURRENT_USER=$(whoami 2>/dev/null || echo "unknown")
 OUTPUT_PATH="."
 SKIP_NETWORK=false
 QUIET=false
 PRIVACY_MODE=false
 EXPORT_JSON=false
+EXPORT_CSV=false
 REPORT_NAME=""
 IS_ROOT=false
+REDACTION_USERS_INITIALISED=false
 
 # Findings array — each entry is: "CATEGORY|NAME|RISK|DESCRIPTION|DETAILS|RECOMMENDATION|REFERENCE"
 declare -a FINDINGS=()
+declare -a REDACTION_USERNAMES=()
 
 # Risk level values for scoring (bash 3.2 compatible)
 risk_value() {
@@ -55,9 +60,19 @@ risk_value() {
 # ARGUMENT PARSING
 # ============================================================================
 
+require_option_value() {
+    local option_name="$1"
+    local value="${2-}"
+    if [[ -z "$value" ]] || [[ "$value" == --* ]]; then
+        echo "ERROR: ${option_name} requires a value." >&2
+        exit 1
+    fi
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --output)
+            require_option_value "--output" "${2-}"
             OUTPUT_PATH="$2"
             shift 2
             ;;
@@ -77,7 +92,12 @@ while [[ $# -gt 0 ]]; do
             EXPORT_JSON=true
             shift
             ;;
+        --export-csv)
+            EXPORT_CSV=true
+            shift
+            ;;
         --report-name)
+            require_option_value "--report-name" "${2-}"
             REPORT_NAME="$2"
             shift 2
             ;;
@@ -98,9 +118,67 @@ done
 # HELPER FUNCTIONS
 # ============================================================================
 
+escape_sed_regex() {
+    printf '%s' "$1" | sed -e 's/[.[\*^$()+?{}|\\/]/\\&/g'
+}
+
+init_redaction_usernames() {
+    $REDACTION_USERS_INITIALISED && return
+    REDACTION_USERS_INITIALISED=true
+
+    local users user
+    users=$(dscl . -list /Users UniqueID 2>/dev/null | awk '$2 >= 500 {print $1}' || echo "")
+    for user in $users; do
+        [[ -z "$user" ]] && continue
+        REDACTION_USERNAMES+=("$user")
+    done
+
+    if [[ -n "${CURRENT_USER:-}" ]]; then
+        REDACTION_USERNAMES+=("$CURRENT_USER")
+    fi
+}
+
+redact_text() {
+    local text="${1:-}"
+    if ! $PRIVACY_MODE; then
+        printf '%s' "$text"
+        return
+    fi
+
+    # Direct token replacements
+    [[ -n "${HOSTNAME_RAW:-}" ]] && text="${text//${HOSTNAME_RAW}/REDACTED_HOST}"
+    [[ -n "${CURRENT_USER:-}" ]] && text="${text//${CURRENT_USER}/REDACTED_USER}"
+    if [[ -n "${SERIAL:-}" ]] && [[ "${SERIAL}" != "Unknown" ]]; then
+        text="${text//${SERIAL}/REDACTED_SERIAL}"
+    fi
+
+    # Pattern-based replacements (IPs, account IDs, serial fields, home paths)
+    text=$(printf '%s' "$text" | sed -E \
+        -e 's#(/Users/)[^/[:space:]]+#\1REDACTED_USER#g' \
+        -e 's/([0-9]{1,3}\.){3}[0-9]{1,3}/REDACTED_IP/g' \
+        -e 's/([0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{1,4}/REDACTED_IP/g' \
+        -e 's/([Ss]erial([[:space:]]+[Nn]umber)?:[[:space:]]*)[^[:space:],|]+/\1REDACTED_SERIAL/g' \
+        -e 's/([Aa]uto-login user:[[:space:]]*)[^[:space:],|]+/\1REDACTED_USER/g' \
+        -e 's/(iCloud:[[:space:]]*)[^[:space:],|]+/\1REDACTED_ACCOUNT/g' \
+        -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/REDACTED_ACCOUNT/g' \
+        -e 's/(AccountID[^[:alnum:]]*)[^[:space:],|"]+/\1REDACTED_ACCOUNT/g')
+
+    # Redact local usernames with boundary-aware substitution
+    init_redaction_usernames
+    local username escaped
+    for username in "${REDACTION_USERNAMES[@]}"; do
+        [[ -z "$username" ]] && continue
+        escaped=$(escape_sed_regex "$username")
+        text=$(printf '%s' "$text" | sed -E "s/(^|[^[:alnum:]_.-])${escaped}([^[:alnum:]_.-]|$)/\\1REDACTED_USER\\2/g")
+    done
+
+    printf '%s' "$text"
+}
+
 log() {
     local level="$1" msg="$2"
     $QUIET && return
+    msg=$(redact_text "$msg")
     if [[ -t 1 ]]; then
         local color reset=$'\033[0m'
         case "$level" in
@@ -119,6 +197,22 @@ log() {
 add_finding() {
     local category="$1" name="$2" risk="$3" description="$4"
     local details="${5:-}" recommendation="${6:-}" reference="${7:-}"
+
+    category=$(redact_text "$category")
+    name=$(redact_text "$name")
+    description=$(redact_text "$description")
+    details=$(redact_text "$details")
+    recommendation=$(redact_text "$recommendation")
+    reference=$(redact_text "$reference")
+
+    # Protect field separator used in FINDINGS serialization
+    category="${category//|/ /}"
+    name="${name//|/ /}"
+    description="${description//|/ /}"
+    details="${details//|/ /}"
+    recommendation="${recommendation//|/ /}"
+    reference="${reference//|/ /}"
+
     # Replace real newlines with literal \n so details survive IFS='|' read splitting
     details="${details//$'\n'/\\n}"
     recommendation="${recommendation//$'\n'/\\n}"
@@ -160,6 +254,35 @@ html_encode() {
     s="${s//\"/&quot;}"
     s="${s//\'/&#39;}"
     echo "$s"
+}
+
+json_escape() {
+    local s="${1:-}"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+build_json_findings() {
+    local json_findings="[" first_f=true
+    local f cat name risk desc details rec ref
+    for f in "${FINDINGS[@]}"; do
+        IFS='|' read -r cat name risk desc details rec ref <<< "$f"
+        $first_f || json_findings+=","
+        first_f=false
+        json_findings+="{\"category\":\"$(json_escape "$cat")\",\"name\":\"$(json_escape "$name")\",\"risk\":\"$(json_escape "$risk")\",\"description\":\"$(json_escape "$desc")\",\"details\":\"$(json_escape "$details")\",\"recommendation\":\"$(json_escape "$rec")\",\"reference\":\"$(json_escape "$ref")\"}"
+    done
+    json_findings+="]"
+    printf '%s' "$json_findings"
+}
+
+csv_escape() {
+    local s="${1:-}"
+    s="${s//\"/\"\"}"
+    printf '"%s"' "$s"
 }
 
 # ============================================================================
@@ -1670,8 +1793,15 @@ generate_html_report() {
         admin_badge="<span style='color:#ff6b6b;font-weight:bold;'>[!!] NOT ROOT</span>"
     fi
 
-    local report_hostname="$HOSTNAME_RAW"
-    $PRIVACY_MODE && report_hostname="REDACTED"
+    local report_hostname report_user report_platform footer_repo_html
+    report_hostname=$(redact_text "$HOSTNAME_RAW")
+    report_user=$(redact_text "${CURRENT_USER:-$(whoami)}")
+    report_platform=$(redact_text "${OS_NAME} ${OS_VERSION} (${OS_BUILD}) — ${CHIP}")
+    if $PRIVACY_MODE; then
+        footer_repo_html="<p>Repository link hidden in privacy mode.</p>"
+    else
+        footer_repo_html="<p><a href=\"https://github.com/macokay/Mac_Security_Audit\" style=\"color:var(--text2);\">github.com/macokay/Mac_Security_Audit</a></p>"
+    fi
 
     # Build findings HTML
     local findings_html=""
@@ -1846,15 +1976,27 @@ generate_html_report() {
     local cis_html="" cis_pass=0 cis_fail=0 cis_unknown=0
 
     cis_row() {
-        local cis_id="$1" label="$2" pass_name="$3" fail_name="$4"
+        local cis_id="$1" label="$2" pass_name="$3" fail_names="${4:-}"
         local status="unknown"
-        if [[ -n "$fail_name" ]] && finding_exists "$fail_name"; then
+        local fail_hit=false
+        if [[ -n "$fail_names" ]]; then
+            local fail_name
+            while IFS= read -r fail_name; do
+                [[ -z "$fail_name" ]] && continue
+                if finding_exists "$fail_name"; then
+                    fail_hit=true
+                    break
+                fi
+            done < <(printf '%s' "$fail_names" | tr '|' '\n')
+        fi
+
+        if $fail_hit; then
             status="fail"; ((cis_fail++)) || true
         elif [[ -n "$pass_name" ]] && finding_exists "$pass_name"; then
             status="pass"; ((cis_pass++)) || true
         else
             # absence-of-fail = pass for controls where negative finding is always emitted
-            if [[ -z "$pass_name" ]] && [[ -n "$fail_name" ]]; then
+            if [[ -z "$pass_name" ]] && [[ -n "$fail_names" ]]; then
                 status="pass"; ((cis_pass++)) || true
             else
                 ((cis_unknown++)) || true
@@ -1868,13 +2010,13 @@ generate_html_report() {
     }
 
     cis_row "1.1"   "Software Update checks enabled"     "Automatic Updates Configured"       "Automatic Update Check Disabled"
-    cis_row "2.1"   "FileVault disk encryption enabled"  "FileVault Enabled"                  "FileVault Disabled"
+    cis_row "2.1"   "FileVault disk encryption enabled"  "FileVault Enabled"                  "FileVault Not Enabled|FileVault Disabled"
     cis_row "2.2"   "Gatekeeper enabled"                 "Gatekeeper Enabled"                 "Gatekeeper Disabled"
     cis_row "2.3"   "System Integrity Protection enabled" "SIP Enabled"                       "SIP Disabled"
     cis_row "2.4.1" "Application firewall enabled"       "Application Firewall Enabled"       "Application Firewall Disabled"
     cis_row "2.4.2" "Stealth mode enabled"               "Stealth Mode Enabled"               "Stealth Mode Disabled"
     cis_row "2.5"   "Password required on wake"          "Password on Wake"                   "No Password on Wake"
-    cis_row "2.6"   "Screen lock timeout ≤ 20 min"       ""                                   "Screen Never Sleeps"
+    cis_row "2.6"   "Screen lock timeout ≤ 20 min"       ""                                   "Screen Never Sleeps|Long Screen Lock Timeout"
     cis_row "2.7"   "Auto-login disabled"                "Auto-Login Disabled"                "Auto-Login Enabled"
     cis_row "2.8"   "Guest account disabled"             "Guest Account Disabled"             "Guest Account Enabled"
     cis_row "3.1"   "Remote login (SSH) disabled"        "Remote Login (SSH) Disabled"        "Remote Login (SSH) Enabled"
@@ -1904,20 +2046,8 @@ generate_html_report() {
     done <<< "$toc_cats"
 
     # --- JSON data for export ---
-    local json_findings="["
-    local first_f=true
-    for f in "${FINDINGS[@]}"; do
-        local cat name risk desc details rec ref
-        IFS='|' read -r cat name risk desc details rec ref <<< "$f"
-        $first_f || json_findings+=","
-        first_f=false
-        # Basic JSON escaping
-        local jcat jname jrisk jdesc jdet jrec jref
-        jcat="${cat//\"/\\\"}"; jname="${name//\"/\\\"}"; jrisk="${risk//\"/\\\"}"
-        jdesc="${desc//\"/\\\"}"; jdet="${details//\"/\\\"}"; jrec="${rec//\"/\\\"}"; jref="${ref//\"/\\\"}"
-        json_findings+="{\"category\":\"${jcat}\",\"name\":\"${jname}\",\"risk\":\"${jrisk}\",\"description\":\"${jdesc}\",\"details\":\"${jdet}\",\"recommendation\":\"${jrec}\",\"reference\":\"${jref}\"}"
-    done
-    json_findings+="]"
+    local json_findings
+    json_findings=$(build_json_findings)
 
     cat << HTMLEOF
 <!DOCTYPE html>
@@ -2011,9 +2141,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,san
 <div class="header-meta">
 <div><strong>Hostname:</strong> ${report_hostname}</div>
 <div><strong>Audit Date:</strong> ${AUDIT_DATE}</div>
-<div><strong>User:</strong> ${CURRENT_USER}</div>
+<div><strong>User:</strong> ${report_user}</div>
 <div><strong>Tool Version:</strong> ${AUDIT_VERSION}</div>
-<div><strong>Platform:</strong> ${OS_NAME} ${OS_VERSION} (${OS_BUILD}) &mdash; ${CHIP}</div>
+<div><strong>Platform:</strong> ${report_platform}</div>
 <div><strong>Privileges:</strong> ${admin_badge}</div>
 </div>
 <div class="header-btns">
@@ -2098,7 +2228,7 @@ ${findings_html}
 <footer class="footer">
 <p>Mac Security Audit Tool v${AUDIT_VERSION} | Generated: ${AUDIT_DATE}</p>
 <p>Copyright &copy; 2026 Mac O Kay. Free to use and modify for personal, non-commercial use.</p>
-<p><a href="https://github.com/macokay/Mac_Security_Audit" style="color:var(--text2);">github.com/macokay/Mac_Security_Audit</a></p>
+${footer_repo_html}
 </footer>
 </div>
 
@@ -2107,7 +2237,7 @@ var AUDIT_DATA = {
   hostname: $(printf '"%s"' "${report_hostname}"),
   date: $(printf '"%s"' "${AUDIT_DATE}"),
   version: $(printf '"%s"' "${AUDIT_VERSION}"),
-  os: $(printf '"%s %s (%s)"' "${OS_NAME}" "${OS_VERSION}" "${OS_BUILD}"),
+  os: $(printf '"%s"' "${report_platform}"),
   score: ${score},
   grade: $(printf '"%s"' "${score_grade}"),
   findings: ${json_findings}
@@ -2162,6 +2292,120 @@ function clearFilter() {
 HTMLEOF
 }
 
+generate_json_report() {
+    local critical=0 high=0 medium=0 low=0 info=0
+    local f firstline after_cat after_name risk
+    for f in "${FINDINGS[@]}"; do
+        firstline="${f%%$'\n'*}"
+        after_cat="${firstline#*|}"
+        after_name="${after_cat#*|}"
+        risk="${after_name%%|*}"
+        case "$risk" in
+            Critical) ((critical++)) ;;
+            High)     ((high++)) ;;
+            Medium)   ((medium++)) ;;
+            Low)      ((low++)) ;;
+            Info)     ((info++)) ;;
+        esac
+    done
+
+    local total_weight=$(( critical * 25 + high * 15 + medium * 8 + low * 3 ))
+    local score=$(( 100 - total_weight ))
+    [[ $score -lt 0 ]] && score=0
+
+    local score_grade
+    if [[ $score -ge 90 ]]; then score_grade="A"
+    elif [[ $score -ge 80 ]]; then score_grade="B"
+    elif [[ $score -ge 70 ]]; then score_grade="C"
+    elif [[ $score -ge 60 ]]; then score_grade="D"
+    else score_grade="F"
+    fi
+
+    local report_hostname report_user report_platform json_findings
+    report_hostname=$(redact_text "$HOSTNAME_RAW")
+    report_user=$(redact_text "${CURRENT_USER:-$(whoami)}")
+    report_platform=$(redact_text "${OS_NAME} ${OS_VERSION} (${OS_BUILD}) — ${CHIP}")
+    json_findings=$(build_json_findings)
+
+    cat << JSONEOF
+{
+  "hostname": "$(json_escape "$report_hostname")",
+  "audit_date": "$(json_escape "$AUDIT_DATE")",
+  "user": "$(json_escape "$report_user")",
+  "version": "$(json_escape "$AUDIT_VERSION")",
+  "platform": "$(json_escape "$report_platform")",
+  "is_root": ${IS_ROOT},
+  "score": ${score},
+  "grade": "$(json_escape "$score_grade")",
+  "counts": {
+    "critical": ${critical},
+    "high": ${high},
+    "medium": ${medium},
+    "low": ${low},
+    "info": ${info},
+    "total": ${#FINDINGS[@]}
+  },
+  "findings": ${json_findings}
+}
+JSONEOF
+}
+
+generate_csv_report() {
+    local critical=0 high=0 medium=0 low=0 info=0
+    local f firstline after_cat after_name risk
+    for f in "${FINDINGS[@]}"; do
+        firstline="${f%%$'\n'*}"
+        after_cat="${firstline#*|}"
+        after_name="${after_cat#*|}"
+        risk="${after_name%%|*}"
+        case "$risk" in
+            Critical) ((critical++)) ;;
+            High)     ((high++)) ;;
+            Medium)   ((medium++)) ;;
+            Low)      ((low++)) ;;
+            Info)     ((info++)) ;;
+        esac
+    done
+
+    local total_weight=$(( critical * 25 + high * 15 + medium * 8 + low * 3 ))
+    local score=$(( 100 - total_weight ))
+    [[ $score -lt 0 ]] && score=0
+
+    local score_grade
+    if [[ $score -ge 90 ]]; then score_grade="A"
+    elif [[ $score -ge 80 ]]; then score_grade="B"
+    elif [[ $score -ge 70 ]]; then score_grade="C"
+    elif [[ $score -ge 60 ]]; then score_grade="D"
+    else score_grade="F"
+    fi
+
+    local report_hostname report_user report_platform
+    report_hostname=$(redact_text "$HOSTNAME_RAW")
+    report_user=$(redact_text "${CURRENT_USER:-$(whoami)}")
+    report_platform=$(redact_text "${OS_NAME} ${OS_VERSION} (${OS_BUILD}) — ${CHIP}")
+
+    printf '%s\n' "audit_date,hostname,user,version,platform,score,grade,category,name,risk,description,details,recommendation,reference"
+    local cat name desc details rec ref
+    for f in "${FINDINGS[@]}"; do
+        IFS='|' read -r cat name risk desc details rec ref <<< "$f"
+        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+            "$(csv_escape "$AUDIT_DATE")" \
+            "$(csv_escape "$report_hostname")" \
+            "$(csv_escape "$report_user")" \
+            "$(csv_escape "$AUDIT_VERSION")" \
+            "$(csv_escape "$report_platform")" \
+            "$(csv_escape "$score")" \
+            "$(csv_escape "$score_grade")" \
+            "$(csv_escape "$cat")" \
+            "$(csv_escape "$name")" \
+            "$(csv_escape "$risk")" \
+            "$(csv_escape "$desc")" \
+            "$(csv_escape "$details")" \
+            "$(csv_escape "$rec")" \
+            "$(csv_escape "$ref")"
+    done
+}
+
 # ============================================================================
 # MAIN EXECUTION
 # ============================================================================
@@ -2171,7 +2415,7 @@ main() {
         cat << 'BANNER'
 
     +===================================================================+
-    |          Mac Security Audit Tool v1.0.0                           |
+    |          Mac Security Audit Tool v1.0.1                           |
     |          Copyright (C) 2026 Mac O Kay                            |
     +===================================================================+
     |  Supported: macOS 12 Monterey and later                           |
@@ -2219,22 +2463,38 @@ BANNER
     test_system_extensions
     test_authentication
     test_firewall_advanced
-    test_network_security_advanced
+    if ! $SKIP_NETWORK; then
+        test_network_security_advanced
+    fi
 
     # Generate report
     mkdir -p "$OUTPUT_PATH"
 
-    local report_hostname="$HOSTNAME_RAW"
-    $PRIVACY_MODE && report_hostname="REDACTED"
+    local report_hostname
+    report_hostname=$(redact_text "$HOSTNAME_RAW")
     local timestamp
     timestamp=$(date '+%Y%m%d_%H%M%S')
     local prefix="${REPORT_NAME:-MacSecurityAudit}"
     local report_file="${OUTPUT_PATH}/${prefix}_${report_hostname}_${timestamp}.html"
+    local json_file="${OUTPUT_PATH}/${prefix}_${report_hostname}_${timestamp}.json"
+    local csv_file="${OUTPUT_PATH}/${prefix}_${report_hostname}_${timestamp}.csv"
 
     generate_html_report > "$report_file"
+    if $EXPORT_JSON; then
+        generate_json_report > "$json_file"
+    fi
+    if $EXPORT_CSV; then
+        generate_csv_report > "$csv_file"
+    fi
 
     log SUCCESS "Audit complete!"
     log INFO "Report saved to: ${report_file}"
+    if $EXPORT_JSON; then
+        log INFO "JSON report saved to: ${json_file}"
+    fi
+    if $EXPORT_CSV; then
+        log INFO "CSV report saved to: ${csv_file}"
+    fi
 
     # Summary
     local critical=0 high=0 medium=0 low=0

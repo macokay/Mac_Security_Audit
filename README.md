@@ -36,7 +36,7 @@
 
 - **50+ security checks** across encryption, firewall, SIP, Gatekeeper, updates, users, network, and more
 - **HTML report** with risk scores, Cyber Essentials mapping, and interactive tables
-- **JSON export** for automation and SIEM integration
+- **JSON + CSV export** for automation and SIEM integration
 - **Privacy mode** redacts hostnames, usernames, IPs, and serial numbers
 - **No dependencies** — uses only native macOS CLI tools
 - **Apple Silicon + Intel** support
@@ -69,8 +69,8 @@ bash audit.sh
 # Full audit with sudo (recommended)
 sudo bash audit.sh
 
-# Custom output directory + JSON export
-sudo bash audit.sh --output ~/Desktop --export-json
+# Custom output directory + JSON and CSV export
+sudo bash audit.sh --output ~/Desktop --export-json --export-csv
 
 # Privacy mode (redacts hostname, username, IP, serial)
 sudo bash audit.sh --privacy
@@ -97,7 +97,7 @@ sudo bash audit.sh --privacy
 
 ### Output
 
-Generates a self-contained HTML report with risk scores and compliance mappings. Optional JSON export via `--export-json`.
+Generates a self-contained HTML report with risk scores and compliance mappings. Optional JSON export via `--export-json` and CSV export via `--export-csv`.
 
 ---
 
